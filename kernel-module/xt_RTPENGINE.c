@@ -26,6 +26,13 @@
 #include <linux/netfilter_ipv6.h>
 #include <linux/netfilter/x_tables.h>
 #include <linux/crc32.h>
+
+#ifndef NO_DTMF_CAPTURE
+#include <linux/kfifo.h>
+#include <linux/time.h>
+#define DTMF_FIFO_SIZE 32
+#endif	// NO_DTMF_CAPTURE
+
 #ifndef __RE_EXTERNAL
 #include <linux/netfilter/xt_RTPENGINE.h>
 #else
@@ -206,6 +213,12 @@ static int proc_blist_open(struct inode *, struct file *);
 static int proc_blist_close(struct inode *, struct file *);
 static ssize_t proc_blist_read(struct file *, char __user *, size_t, loff_t *);
 
+#ifndef NO_DTMF_CAPTURE
+static int proc_dtmfevents_open(struct inode *, struct file *);
+static int proc_dtmfevents_close(struct inode *, struct file *);
+static ssize_t proc_dtmfevents_read(struct file *, char __user *, size_t, loff_t *);
+#endif // NO_DTMF_CAPTURE
+
 static int proc_main_list_open(struct inode *, struct file *);
 
 static void *proc_main_list_start(struct seq_file *, loff_t *);
@@ -366,6 +379,13 @@ struct rtpengine_table {
 	struct proc_dir_entry		*proc_blist;
 	struct proc_dir_entry		*proc_calls;
 
+#ifndef NO_DTMF_CAPTURE
+	struct proc_dir_entry		*dtmfevents;
+
+	spinlock_t			dtmfevents_lock;
+	DECLARE_KFIFO_PTR(dtmfevents_fifo, struct mediaproxy_dtmfevent);
+#endif	// NO_DTMF_CAPTURE
+
 	struct re_dest_addr_hash	dest_addr_hash;
 
 	unsigned int			num_targets;
@@ -408,7 +428,6 @@ struct rtp_extension {
 	u_int16_t undefined;
 	u_int16_t length;
 } __attribute__ ((packed));
-
 
 struct rtp_parsed {
 	struct rtp_header		*header;
@@ -475,6 +494,14 @@ static const struct file_operations proc_blist_ops = {
 	.read			= proc_blist_read,
 	.release		= proc_blist_close,
 };
+
+#ifndef NO_DTMF_CAPTURE
+static const struct file_operations proc_dtmfevents_ops = {
+	.open			= proc_dtmfevents_open,
+	.read			= proc_dtmfevents_read,
+	.release		= proc_dtmfevents_close,
+};
+#endif	// NO_DTMF_CAPTURE
 
 static const struct seq_operations proc_list_seq_ops = {
 	.start			= proc_list_start,
@@ -623,6 +650,9 @@ static void auto_array_free(struct re_auto_array *a) {
 
 static struct rtpengine_table *new_table(void) {
 	struct rtpengine_table *t;
+#ifndef NO_DTMF_CAPTURE
+	int ret;
+#endif // NO_DTMF_CAPTURE
 	unsigned int i;
 
 	DBG("Creating new table\n");
@@ -649,6 +679,15 @@ static struct rtpengine_table *new_table(void) {
 		INIT_HLIST_HEAD(&t->streams_hash[i]);
 		spin_lock_init(&t->streams_hash_lock[i]);
 	}
+
+#ifndef NO_DTMF_CAPTURE
+	spin_lock_init(&t->dtmfevents_lock);
+	if (kfifo_alloc(&t->dtmfevents_fifo, DTMF_FIFO_SIZE, GFP_KERNEL)) {
+		printk(KERN_ERR "Error creating DTMF event fifo: %d\n", ret);
+		module_put(THIS_MODULE);
+		return NULL;
+	}
+#endif // NO_DTMF_CAPTURE
 
 	return t;
 }
@@ -735,6 +774,13 @@ static int table_create_proc(struct rtpengine_table *t, u_int32_t id) {
 	t->proc_calls = proc_mkdir_user("calls", S_IRUGO | S_IXUGO, t->proc_root);
 	if (!t->proc_calls)
 		return -1;
+
+#ifndef NO_DTMF_CAPTURE
+	t->dtmfevents = proc_create_data("dtmfevents", S_IFREG | S_IRUGO, t->proc_root,
+			&proc_dtmfevents_ops, (void *) (unsigned long) id);
+	if (!t->dtmfevents)
+		return -1;
+#endif	// NO_DTMF_CAPTURE
 
 	return 0;
 }
@@ -886,6 +932,10 @@ static void table_put(struct rtpengine_table *t) {
 	}
 
 	clear_table_proc_files(t);
+
+#ifndef NO_DTMF_CAPTURE
+	kfifo_free(&t->dtmfevents_fifo);
+#endif // NO_DTMF_CAPTURE
 	kfree(t);
 
 	module_put(THIS_MODULE);
@@ -1367,6 +1417,88 @@ err:
 	table_put(t);
 	return err;
 }
+
+
+#ifndef NO_DTMF_CAPTURE
+static int proc_dtmfevents_open(struct inode *i, struct file *f) {
+	u_int32_t id;
+	struct rtpengine_table *t;
+
+	id = (u_int32_t) (unsigned long) PDE_DATA(i);
+	t = get_table(id);
+	printk(KERN_DEBUG "proc_dtmfevents_open: id: %u   t: %p\n", id, t);
+	if (!t)
+		return -ENOENT;
+
+	table_put(t);
+
+	return 0;
+}
+
+static int proc_dtmfevents_close(struct inode *i, struct file *f) {
+	u_int32_t id;
+	struct rtpengine_table *t;
+
+	id = (u_int32_t) (unsigned long) PDE_DATA(i);
+	t = get_table(id);
+	printk(KERN_DEBUG "proc_dtmfevents_close: id: %u   t: %p\n", id, t);
+	if (!t)
+		return 0;
+
+	table_put(t);
+
+	return 0;
+}
+
+static ssize_t proc_dtmfevents_read(struct file *f, char __user *b, size_t l, loff_t *o) {
+	struct inode *inode;
+	u_int32_t id;
+	struct rtpengine_table *t;
+	int err;
+	unsigned long flags;
+	unsigned int copied;
+	static int log_damp;
+
+	if (l != sizeof(struct mediaproxy_dtmfevent)) {
+		printk(KERN_DEBUG "invalid read size: %ld != %lu\n", l, sizeof(struct mediaproxy_dtmfevent));
+		return -EINVAL;
+	}
+	if (*o < 0) {
+		printk(KERN_DEBUG "invalid offset %lld\n", *o);
+		return -EINVAL;
+	}
+
+	inode = f->f_path.dentry->d_inode;
+	id = (u_int32_t) (unsigned long) PDE_DATA(inode);
+	t = get_table(id);
+	if ((++log_damp) > 100) {
+		printk(KERN_DEBUG "proc_dtmfevents_read: id: %u   t: %p    inode: %p\n", id, t, inode);
+		log_damp = 0;
+	}
+
+	if (!t) {
+		printk(KERN_DEBUG "no such table: %d", id);
+		return -ENOENT;
+	}
+
+	memset(b, 0, l);
+
+	spin_lock_irqsave(&t->dtmfevents_lock, flags);
+
+	err = kfifo_to_user(&t->dtmfevents_fifo, b, l, &copied );
+
+	spin_unlock_irqrestore(&t->dtmfevents_lock, flags);
+
+	if (err < 0)
+		printk(KERN_DEBUG "kfifo_to_user error: %d\n", err);
+
+	if (!err)
+		err = copied;
+
+	table_put(t);
+	return err;
+}
+#endif	//NO_DTMF_CAPTURE
 
 static int proc_list_open(struct inode *i, struct file *f) {
 	int err;
@@ -3830,6 +3962,7 @@ static unsigned int rtpengine46(struct sk_buff *skb, struct rtpengine_table *t, 
 	struct re_stream_packet *packet;
 	const char *errstr = NULL;
 
+
 #if (RE_HAS_MEASUREDELAY)
 	u_int64_t starttime, endtime, delay;
 #endif
@@ -3922,6 +4055,37 @@ src_check_ok:
 		goto skip_error;
 
 	skb_trim(skb, rtp.header_len + rtp.payload_len);
+
+#ifndef	NO_DTMF_CAPTURE
+	if (is_dtmf_event(rtp.header->m_pt,
+			  rtp.header->timestamp,
+			  rtp.payload,
+			  g->target.dtmf_payload_type,
+			  g->target.last_dtmf_event_timestamp)) {
+		struct mediaproxy_dtmfevent d;
+		struct timeval tv;
+		unsigned long flags;
+		struct telephone_event_payload *p;
+
+		p = (struct telephone_event_payload *)rtp.payload;
+
+		g->target.last_dtmf_event_timestamp = rtp.header->timestamp;
+
+		do_gettimeofday(&tv);
+
+		d.target_info	= g->target;
+		d.event		= p->event;
+		d.duration	= ntohs(p->duration);
+		d.volume	= p->volume;
+		d.timestamp	= tv.tv_sec;
+
+		spin_lock_irqsave(&t->dtmfevents_lock, flags);
+		printk(KERN_DEBUG "added kernel DTMF event\n");
+		if (!kfifo_put(&t->dtmfevents_fifo, d))
+			printk(KERN_DEBUG "DTMF FIFO is full for table %u...\n", t->id);
+		spin_unlock_irqrestore(&t->dtmfevents_lock, flags);
+	}
+#endif	// NO_DTMF_CAPTURE
 
 	DBG("packet payload decrypted as %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x...\n",
 			rtp.payload[0], rtp.payload[1], rtp.payload[2], rtp.payload[3],
@@ -4218,6 +4382,9 @@ static int __init init(void) {
 	if (ret)
 		goto fail;
 
+#ifndef NO_DTMF_CAPTURE
+	printk(KERN_INFO "sizeof(struct mediaproxy_dtmfevent): %ld\n", sizeof(struct mediaproxy_dtmfevent));
+#endif	// NO_DTMF_CAPTURE
 	return 0;
 
 fail:

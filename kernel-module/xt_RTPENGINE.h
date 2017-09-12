@@ -103,6 +103,10 @@ struct rtpengine_target_info {
 					rtp:1,
 					rtp_only:1,
 					do_intercept:1;
+#ifndef NO_DTMF_CAPTURE
+	unsigned char			dtmf_payload_type;
+	u_int32_t			last_dtmf_event_timestamp; // used to filter repeating end-marker packets
+#endif	//NO_DTMF_CAPTURE
 };
 
 struct rtpengine_call_info {
@@ -161,5 +165,45 @@ struct rtpengine_list_entry {
 	struct rtpengine_rtp_stats	rtp_stats[NUM_PAYLOAD_TYPES];
 };
 
+#ifndef NO_DTMF_CAPTURE
+struct mediaproxy_dtmfevent {
+	struct rtpengine_target_info	target_info;
+	unsigned long			timestamp;
+	unsigned char			event;
+	unsigned char			volume;
+	u_int16_t			duration;
+} __attribute__ ((packed));
+
+struct telephone_event_payload {
+       u_int8_t event;
+       unsigned volume:6;
+       unsigned r:1;
+       unsigned end:1;
+       u_int16_t duration;
+} __attribute__ ((packed));
+
+inline int is_dtmf_event(unsigned char m_pt, uint32_t timestamp, void *payload, unsigned char type, u_int32_t last_event)
+{
+	struct telephone_event_payload *p = payload;
+	unsigned char pt = m_pt & 0x7F;
+
+	if (!type)
+		return 0;
+
+	if (type != pt)
+		return 0;
+
+	if (p->event > 16)
+		return 0;
+
+	if (!p->end)
+		return 0;
+
+	if (timestamp == last_event)
+		return 0;
+
+	return 1;
+}
+#endif	//NO_DTMF_CAPTURE
 
 #endif
