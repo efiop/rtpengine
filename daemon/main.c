@@ -35,6 +35,10 @@
 #include "rtcp.h"
 #include "iptables.h"
 
+#ifndef NO_DTMF_CAPTURE
+#include "xt_RTPENGINE.h"
+#endif	// NO_DTMF_CAPTURE
+
 
 
 struct main_context {
@@ -626,6 +630,75 @@ no_kernel:
 	set_graphite_interval_tv(&tmp_tv);
 }
 
+#ifndef NO_DTMF_CAPTURE
+
+static void dtmf_log_events(struct callmaster *cm, GList *event_list)
+{
+	GList *li;
+
+	for (li = event_list; li; li = g_list_delete_link(li, li)) {
+		char *event_json;
+
+		event_json = get_dtmf_event_as_json(li, cm);
+		if (event_json) {
+			ilog(LOG_DEBUG, "%s: DTMF event: %s\n", __func__, event_json);
+			free(event_json);
+		} else
+			ilog(LOG_DEBUG, "%s: DTMF event error...\n", __func__);
+
+		free(li->data);
+	}
+}
+
+static void dtmf_capture_kernel_events(struct callmaster *cm)
+{
+	GList *event_list;
+
+	event_list = kernel_dtmf_event_list();
+	if (!event_list) {
+		ilog(LOG_DEBUG, "%s: no kernel dtmf events available\n", __func__);
+		return;
+	}
+
+	ilog(LOG_DEBUG, "%s: available kernel dtmf events %u\n",
+					__func__, g_list_length(event_list));
+	dtmf_log_events(cm, event_list);
+}
+
+static void dtmf_capture_events(struct callmaster *cm)
+{
+	mutex_lock(&dtmf_event_list_lock);
+
+	if (!dtmf_event_list) {
+		ilog(LOG_DEBUG, "%s: no userspace dtmf events available\n", __func__);
+		goto out;
+	}
+
+	ilog(LOG_DEBUG, "%s: available userspace dtmf events %u\n",
+				__func__, g_list_length(dtmf_event_list));
+
+	dtmf_log_events(cm, dtmf_event_list);
+
+	dtmf_event_list = NULL;
+out:
+	mutex_unlock(&dtmf_event_list_lock);
+}
+
+static void dtmf_capture_loop(void *d) {
+	struct callmaster *cm = d;
+
+	while (!g_shutdown) {
+		ilog(LOG_DEBUG, "%s: still alive\n", __func__);
+
+		dtmf_capture_kernel_events(cm);
+		dtmf_capture_events(cm);
+
+		usleep(100000);
+	}
+	ilog(LOG_DEBUG, "%s: ended\n", __func__);
+}
+
+#endif	// NO_DTMF_CAPTURE
 
 int main(int argc, char **argv) {
 	struct main_context ctx;
@@ -660,6 +733,10 @@ int main(int argc, char **argv) {
 	for (;idx<num_threads;++idx) {
 		thread_create_detach(poller_loop, ctx.p);
 	}
+
+#ifndef NO_DTMF_CAPTURE
+	thread_create_detach(dtmf_capture_loop, ctx.m);
+#endif	// NO_DTMF_CAPTURE
 
 	while (!g_shutdown) {
 		usleep(100000);

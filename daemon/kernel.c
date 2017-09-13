@@ -168,6 +168,38 @@ GList *kernel_list() {
 	return li;
 }
 
+#ifndef NO_DTMF_CAPTURE
+GList *kernel_dtmf_event_list() {
+	struct mediaproxy_dtmfevent *buf;
+	GList *li = NULL;
+	int ret;
+	char str[64];
+	int fd;
+
+	if (!kernel.is_open)
+		return NULL;
+
+	sprintf(str, PREFIX "/%u/dtmfevents", kernel.table);
+	fd = open(str, O_RDONLY);
+	if (fd == -1)
+		return NULL;
+
+	while (1) {
+		buf = (struct mediaproxy_dtmfevent *)malloc(sizeof(*buf));
+		ret = read(fd, buf, sizeof(*buf));
+		if (ret != sizeof(*buf)) {
+			free(buf);
+			break;
+		}
+		li = g_list_prepend(li, buf);
+	}
+
+	close(fd);
+
+	return li;
+}
+#endif	// NO_DTMF_CAPTURE
+
 unsigned int kernel_add_call(const char *id) {
 	struct rtpengine_message msg;
 	int ret;

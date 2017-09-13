@@ -36,6 +36,10 @@ int kernel_add_stream(struct rtpengine_target_info *, int);
 int kernel_del_stream(const struct re_address *);
 GList *kernel_list();
 
+#ifndef NO_DTMF_CAPTURE
+GList *kernel_dtmf_event_list();
+#endif	// NO_DTMF_CAPTURE
+
 unsigned int kernel_add_call(const char *id);
 int kernel_del_call(unsigned int);
 

@@ -162,6 +162,18 @@ struct attribute_rtpmap {
 	struct rtp_payload_type rtp_pt;
 };
 
+#ifndef NO_DTMF_CAPTURE
+struct attribute_telephone_event {
+	unsigned char payload_type;
+	unsigned int clock_rate;
+};
+
+struct attribute_fmtp {
+	unsigned char payload_type;
+	str *value;
+};
+#endif	// NO_DTMF_CAPTURE
+
 struct sdp_attribute {
 	str full_line,	/* including a= and \r\n */
 	    line_value,	/* without a= and without \r\n */
@@ -193,6 +205,10 @@ struct sdp_attribute {
 		ATTR_SETUP,
 		ATTR_RTPMAP,
 		ATTR_IGNORE,
+#ifndef NO_DTMF_CAPTURE
+		ATTR_TELEPHONE_EVENT,
+		ATTR_FMTP,
+#endif	// NO_DTMF_CAPTURE
 		ATTR_END_OF_CANDIDATES,
 	} attr;
 
@@ -205,6 +221,10 @@ struct sdp_attribute {
 		struct attribute_fingerprint fingerprint;
 		struct attribute_setup setup;
 		struct attribute_rtpmap rtpmap;
+#ifndef NO_DTMF_CAPTURE
+		struct attribute_telephone_event telephone_event;
+		struct attribute_fmtp fmtp;
+#endif	// NO_DTMF_CAPTURE
 	} u;
 };
 
@@ -702,6 +722,229 @@ static int parse_attribute_setup(struct sdp_attribute *output) {
 	return 0;
 }
 
+#ifndef NO_DTMF_CAPTURE
+static int parse_attribute_rtpmap(struct sdp_attribute *output) {
+	str pt_name;
+	str clock_rate_s;
+	unsigned int clock_rate;
+	unsigned char payload_type;
+
+	memcpy(&pt_name, &output->param, sizeof(str));
+	str_init(&clock_rate_s, 0);
+
+	str_chr_str(&clock_rate_s, &pt_name, '/' );
+	if (clock_rate_s.len <= 0) {
+		ilog(LOG_ERROR, "invalid clockrate: '" STR_FORMAT "'",
+						STR_FMT(&clock_rate_s));
+		return -1;
+	}
+
+	pt_name.len = clock_rate_s.s - pt_name.s;
+	clock_rate_s.s++;
+
+	ilog(LOG_DEBUG, "rtpmap payload type: '" STR_FORMAT "'\n", STR_FMT(&pt_name));
+
+	if (str_cmp(&pt_name, "telephone-event"))
+		return 0;
+
+	/* atoi stops at first non-numeric character (in this case the space) */
+	payload_type = atoi(output->value.s);
+
+	/* Check dynamic range boundaries */
+	if (payload_type < 96 ||
+	    payload_type > 127) {
+		ilog(LOG_ERROR, "invalid payload type %d", payload_type);
+		return -1;
+	}
+
+	clock_rate = atoi(clock_rate_s.s);
+	if (clock_rate == 0) {
+		ilog(LOG_ERROR, "invalid clockrate: '" STR_FORMAT "'",
+						STR_FMT(&clock_rate_s));
+		return -1;
+	}
+
+	output->attr				= ATTR_TELEPHONE_EVENT;
+	output->u.telephone_event.payload_type	= payload_type;
+	output->u.telephone_event.clock_rate	= clock_rate;
+
+	ilog(LOG_DEBUG, "output->u.telephone_event.payload_type: %d\n",
+				output->u.telephone_event.payload_type);
+
+	return 0;
+}
+
+static int parse_attribute_fmtp(struct sdp_attribute *output) {
+	unsigned char payload_type;
+
+	/* atoi stops at first non-numeric character (in this case the space) */
+	payload_type = atoi(output->value.s);
+
+	/* Check dynamic range boundaries */
+	if (payload_type < 96 ||
+	    payload_type > 127)
+		return -1;
+
+	output->attr			= ATTR_FMTP;
+	output->u.fmtp.payload_type	= payload_type;
+	output->u.fmtp.value		= &output->param;
+
+	ilog(LOG_DEBUG, "value: " STR_FORMAT "   param: " STR_FORMAT "\n",
+			STR_FMT(&output->value), STR_FMT(&output->param));
+	return 0;
+}
+
+static GHashTable *collect_telephone_event_payloads(struct sdp_media *media) {
+	GList *q;
+	struct sdp_attribute *attr;
+	GHashTable *telephone_event_payloads;
+
+	telephone_event_payloads = g_hash_table_new(g_int_hash, g_int_equal);
+	if (!telephone_event_payloads)
+		return NULL;
+
+	/* a=rtpmap telephone-event */
+	for (q = media->attributes.list.head; q; q = q->next) {
+		attr = q->data;
+		ilog(LOG_DEBUG, "attr.name: " STR_FORMAT
+				"  attr.full_line: " STR_FORMAT
+				"  attr->u.telephone_event.payload_type: %d"
+				"  attr->u.telephone_event.clock_rate: %d\n",
+				STR_FMT(&attr->name),
+				STR_FMT(&attr->full_line),
+				attr->u.telephone_event.payload_type,
+				attr->u.telephone_event.clock_rate);
+		if (attr->attr == ATTR_TELEPHONE_EVENT) {
+			g_hash_table_insert(telephone_event_payloads,
+					    &attr->u.telephone_event.payload_type,
+					    GINT_TO_POINTER(attr->u.telephone_event.clock_rate));
+			ilog(LOG_DEBUG, "telephone event found, current count: %d",
+						g_hash_table_size(telephone_event_payloads));
+		}
+	}
+
+	return telephone_event_payloads;
+}
+
+static int filter_telephone_event_payloads(struct sdp_media *media,
+				   struct stream_params *sp,
+				   GHashTable *telephone_event_payloads) {
+	pcre *re;
+	GList *q;
+	int erroff;
+	int ovector[20];
+	pcre_extra *ree;
+	const char *errptr;
+	struct sdp_attribute *attr;
+
+	re = pcre_compile("(\\d+)(-(\\d+)){0,1}", 0, &errptr, &erroff, NULL);
+	if (!re) {
+		ilog(LOG_ERROR, "Error compiling regular expression: %s  at %d\n", errptr, erroff);
+		return -1;
+	}
+
+	ree = pcre_study(re, 0, &errptr);
+	for (q = media->attributes.list.head; q; q = q->next) {
+		int r;
+		int range_ok = 0;
+		str *range_list_str;
+		gchar **range_list, **range_list_it;
+
+		attr = q->data;
+		if (attr->attr != ATTR_FMTP)
+			continue;
+
+		if (!g_hash_table_lookup(telephone_event_payloads, &attr->u.fmtp.payload_type)) {
+			ilog(LOG_DEBUG, "payload type %u not found\n", attr->u.fmtp.payload_type);
+			continue;
+		}
+
+		range_list_str = str_dup(attr->u.fmtp.value);
+		range_list = g_strsplit(range_list_str->s, ",", -1);
+		for (range_list_it = range_list; *range_list_it != 0; range_list_it++) {
+			int range_start, range_end;
+			const char *range_start_s, *range_end_s;
+
+			ilog(LOG_DEBUG, "parsing range: '%s'", *range_list_it);
+
+			r = pcre_exec(re, ree, *range_list_it, strlen(*range_list_it),
+							0, 0, ovector, G_N_ELEMENTS(ovector));
+			if (r <= 0) {
+				ilog(LOG_ERROR, "Cannot parse range: '%s'", *range_list_it);
+				break;
+			}
+
+			pcre_get_substring(*range_list_it, ovector, r, 1, &range_start_s);
+			pcre_get_substring(*range_list_it, ovector, r, 3, &range_end_s);
+			if (range_end_s[0] == 0)
+				range_end_s = range_start_s;
+
+			ilog(LOG_DEBUG, "start: '%s'  end: '%s'", range_start_s, range_end_s);
+
+			range_start	= atoi(range_start_s);
+			range_end	= atoi(range_end_s);
+
+			if (range_start_s != range_end_s)
+				pcre_free_substring(range_end_s);
+			pcre_free_substring(range_start_s);
+
+			if (range_end < range_start || range_start > 255 || range_end > 255) {
+				ilog(LOG_ERROR, "invalid range: %d-%d", range_start, range_end);
+				break;
+			}
+
+			if (range_start <= 15) {
+				ilog(LOG_DEBUG, "event range contains DTMF events");
+				range_ok = 1;
+			}
+		}
+
+		g_strfreev(range_list);
+		free(range_list_str);
+
+		if (!range_ok)
+			g_hash_table_remove(telephone_event_payloads,
+					    GINT_TO_POINTER(attr->u.fmtp.payload_type));
+	}
+
+	pcre_free_study(ree);
+	pcre_free(re);
+
+	return 0;
+}
+
+static void process_telephone_event(struct sdp_media *media,
+				    struct stream_params *sp) {
+	GList *q;
+	GHashTable *telephone_event_payloads = NULL;
+
+	telephone_event_payloads = collect_telephone_event_payloads(media);
+	if (!telephone_event_payloads)
+		goto out;
+
+	if (filter_telephone_event_payloads(media, sp, telephone_event_payloads))
+		goto out;
+
+	if (g_hash_table_size(telephone_event_payloads) == 0)
+		goto out;
+
+	q = g_hash_table_get_keys(telephone_event_payloads);
+	sp->dtmf_payload_type = *((int *)(q->data));
+	g_list_free(q);
+
+	q = g_hash_table_get_values(telephone_event_payloads);
+	sp->dtmf_payload_clock_rate = GPOINTER_TO_INT(q->data);
+	g_list_free(q);
+
+	ilog(LOG_DEBUG, "DTMF payload type: %d   clock rate: %d",
+			sp->dtmf_payload_type, sp->dtmf_payload_clock_rate);
+out:
+	if (telephone_event_payloads)
+		g_hash_table_destroy(telephone_event_payloads);
+}
+
+#else
+
 static int parse_attribute_rtpmap(struct sdp_attribute *output) {
 	PARSE_DECL;
 	char *ep;
@@ -746,6 +989,7 @@ static int parse_attribute_rtpmap(struct sdp_attribute *output) {
 
 	return 0;
 }
+#endif //NO_DTMF_CAPTURE
 
 static int parse_attribute(struct sdp_attribute *a) {
 	int ret;
@@ -784,6 +1028,10 @@ static int parse_attribute(struct sdp_attribute *a) {
 				ret = parse_attribute_rtcp(a);
 			else if (!str_cmp(&a->name, "ssrc"))
 				ret = parse_attribute_ssrc(a);
+#ifndef NO_DTMF_CAPTURE
+			else if (!str_cmp(&a->name, "fmtp"))
+				ret = parse_attribute_fmtp(a);
+#endif	// NO_DTMF_CAPTURE
 			break;
 		case 5:
 			if (!str_cmp(&a->name, "group"))
@@ -1270,6 +1518,9 @@ int sdp_streams(const GQueue *sessions, GQueue *streams, struct sdp_ng_flags *fl
 				memcpy(sp->fingerprint.digest, attr->u.fingerprint.fingerprint,
 						sp->fingerprint.hash_func->num_bytes);
 			}
+#ifndef NO_DTMF_CAPTURE
+			process_telephone_event(media, sp);
+#endif	// NO_DTMF_CAPTURE
 
 			__sdp_ice(sp, media);
 

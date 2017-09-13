@@ -1005,6 +1005,10 @@ void kernelize(struct packet_stream *stream) {
 		g_list_free(values);
 	}
 
+#ifndef NO_DTMF_CAPTURE
+	reti.dtmf_payload_type = stream->dtmf_payload_type;
+#endif	// NO_DTMF_CAPTURE
+
 	recording_stream_kernel_info(stream, &reti);
 
 	kernel_add_stream(&reti, 0);
@@ -1175,6 +1179,9 @@ static int stream_packet(struct stream_fd *sfd, str *s, const endpoint_t *fsin, 
 	struct rtp_header *rtp_h;
 	struct rtcp_packet *rtcp_h;
 	struct rtp_stats *rtp_s;
+#ifndef NO_DTMF_CAPTURE
+	struct telephone_event_payload *p;
+#endif	// NO_DTMF_CAPTURE
 	struct ssrc_ctx *ssrc_in = NULL, *ssrc_out = NULL;
 
 	call = sfd->call;
@@ -1481,6 +1488,34 @@ forward:
 		atomic64_inc(&cm->statsps.errors);
 		goto out;
 	}
+#ifndef NO_DTMF_CAPTURE
+	if (!rtp_payload(&rtp_h, (str *)&p, s) &&
+	    is_dtmf_event(rtp_h->m_pt, rtp_h->timestamp, (void *)p,
+			  sfd->stream->dtmf_payload_type,
+			  sfd->stream->last_dtmf_event_timestamp)) {
+		struct mediaproxy_dtmfevent *dtmf_event;
+
+		sfd->stream->last_dtmf_event_timestamp = rtp_h->timestamp;
+
+		dtmf_event = (struct mediaproxy_dtmfevent *)malloc(sizeof(*dtmf_event));
+		memset(dtmf_event, 0, sizeof(*dtmf_event));
+
+		dtmf_event->timestamp	= time(NULL);
+		dtmf_event->event	= p->event;
+		dtmf_event->duration	= p->duration;
+		dtmf_event->volume	= p->volume;
+
+		__re_address_translate_ep(&dtmf_event->target_info.src_addr, &sfd->stream->endpoint);
+
+		dtmf_event->target_info.local.port = sfd->stream->selected_sfd->socket.local.port;
+
+		mutex_lock(&dtmf_event_list_lock);
+		ilog(LOG_DEBUG, "%s: added userspace DTMF event\n", __func__);
+		dtmf_event_list = g_list_prepend(dtmf_event_list, dtmf_event);
+		mutex_unlock(&dtmf_event_list_lock);
+	}
+#endif	// NO_DTMF_CAPTURE
+
 
 	sink = NULL;
 

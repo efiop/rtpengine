@@ -242,6 +242,10 @@ struct stream_params {
 	GQueue			ice_candidates; /* slice-alloc'd */
 	str			ice_ufrag;
 	str			ice_pwd;
+#ifndef NO_DTMF_CAPTURE
+	unsigned char		dtmf_payload_type;
+	unsigned int		dtmf_payload_clock_rate;
+#endif	// NO_DTMF_CAPTURE
 };
 
 struct endpoint_map {
@@ -301,6 +305,12 @@ struct packet_stream {
 
 	/* in_lock must be held for SETTING these: */
 	volatile unsigned int	ps_flags;
+
+#ifndef NO_DTMF_CAPTURE
+	unsigned char		dtmf_payload_type;
+	unsigned int		dtmf_payload_clock_rate;
+	u_int32_t		last_dtmf_event_timestamp;
+#endif	// NO_DTMF_CAPTURE
 };
 
 /* protected by call->master_lock, except the RO elements */
@@ -440,6 +450,11 @@ struct callmaster {
 	struct timeval          latest_graphite_interval_start;
 };
 
+#ifndef NO_DTMF_CAPTURE
+extern GList *dtmf_event_list;
+extern mutex_t dtmf_event_list_lock;
+#endif	// NO_DTMF_CAPTURE
+
 struct callmaster *callmaster_new(struct poller *);
 void callmaster_get_all_calls(struct callmaster *m, GQueue *q);
 
@@ -475,6 +490,10 @@ void __payload_type_free(void *p);
 void __rtp_stats_update(GHashTable *dst, GHashTable *src);
 
 const struct rtp_payload_type *__rtp_stats_codec(struct call_media *m);
+
+#ifndef NO_DTMF_CAPTURE
+char *get_dtmf_event_as_json(GList *li, struct callmaster *m);
+#endif	// NO_DTMF_CAPTURE
 
 #include "str.h"
 #include "rtp.h"

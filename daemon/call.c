@@ -43,6 +43,13 @@
 #include "ssrc.h"
 
 
+#ifndef NO_DTMF_CAPTURE
+#include <json-glib/json-glib.h>
+
+GList *dtmf_event_list = NULL;
+mutex_t dtmf_event_list_lock;
+#endif	// NO_DTMF_CAPTURE
+
 /* also serves as array index for callstream->peers[] */
 struct iterator_helper {
 	GSList			*del_timeout;
@@ -1013,6 +1020,10 @@ static int __init_streams(struct call_media *A, struct call_media *B, const stru
 			__fill_stream(a, &sp->rtp_endpoint, port_off, sp);
 			bf_copy_same(&a->ps_flags, &sp->sp_flags,
 					SHARED_FLAG_STRICT_SOURCE | SHARED_FLAG_MEDIA_HANDOVER);
+#ifndef NO_DTMF_CAPTURE
+			a->dtmf_payload_type = sp->dtmf_payload_type;
+			a->dtmf_payload_clock_rate = sp->dtmf_payload_clock_rate;
+#endif	// NO_DTMF_CAPTURE
 		}
 		bf_copy_same(&a->ps_flags, &A->media_flags, SHARED_FLAG_ICE);
 
@@ -2587,3 +2598,178 @@ const struct transport_protocol *transport_protocol(const str *s) {
 out:
 	return NULL;
 }
+
+#ifndef NO_DTMF_CAPTURE
+struct dtmf_event_call_iterator_data {
+	int found;
+	unsigned int clock_rate;
+	JsonBuilder *builder;
+	u_int16_t port;
+};
+
+#define JB_SET_STR(f...) do {					\
+		char __tmp[2048];				\
+		snprintf(__tmp, sizeof(__tmp), f);		\
+		json_builder_add_string_value(builder, __tmp);	\
+	} while (0)
+
+#define JB_SET(name, f...) do {					\
+		json_builder_set_member_name(builder, name);	\
+		JB_SET_STR(f);					\
+	} while (0)
+
+static void dtmf_event_call_iterator(void *key, void *val, void *ptr) {
+	struct call *c = val;
+	struct dtmf_event_call_iterator_data *d = ptr;
+	struct stream_fd *sfd;
+	struct packet_stream *ps;
+	struct call_monologue *ml;
+	GList *it;
+	GList *tag_it, *tag_values;
+	JsonBuilder *builder = d->builder;
+
+	if (d->found)
+		return;
+
+	rwlock_lock_r(&c->master_lock);
+
+	if (g_queue_is_empty(&c->streams))
+		goto out;
+
+	for (it = g_queue_peek_head_link(&c->streams); it; it = it->next) {
+		ps = it->data;
+
+		if (d->found)
+			break;
+
+		mutex_lock(&ps->in_lock);
+
+		if (!ps->media)
+			goto next;
+
+		sfd = ps->selected_sfd;
+		if (!sfd)
+			goto next;
+
+		if (sfd->socket.local.port != d->port)
+			goto next;
+
+		d->found	= 1;
+		d->clock_rate	= sfd->stream->dtmf_payload_clock_rate;
+
+		JB_SET("callid", STR_FORMAT, STR_FMT(&c->callid));
+		JB_SET("source_tag", STR_FORMAT, STR_FMT(&ps->media->monologue->tag));
+
+		json_builder_set_member_name(builder, "tags");
+		json_builder_begin_array(builder);
+
+		tag_values = g_hash_table_get_values(c->tags);
+		for (tag_it = tag_values; tag_it; tag_it = tag_it->next) {
+			ml = tag_it->data;
+			JB_SET_STR(STR_FORMAT, STR_FMT(&ml->tag));
+		}
+		g_list_free(tag_values);
+
+		json_builder_end_array(builder);
+next:
+		mutex_unlock(&ps->in_lock);
+	}
+out:
+	rwlock_unlock_r(&c->master_lock);
+}
+
+static void snprintf_dtmf_ip_addr(char *ipaddr_str, size_t len, struct re_address *src_addr) {
+	struct in_addr tmp_addr4;
+	struct in6_addr tmp_addr6;
+
+	memset(ipaddr_str, 0, len);
+	switch (src_addr->family) {
+	case AF_INET:
+		ZERO(tmp_addr4);
+		tmp_addr4.s_addr = src_addr->u.ipv4;
+		inet_ntop(src_addr->family,
+			  &tmp_addr4,
+			  ipaddr_str,
+			  len);
+		break;
+	case AF_INET6:
+		ZERO(tmp_addr6);
+		memcpy(&tmp_addr6.s6_addr,
+		       src_addr->u.ipv6,
+		       sizeof(tmp_addr6.s6_addr));
+		inet_ntop(src_addr->family,
+			  &tmp_addr6,
+			  ipaddr_str,
+			  len);
+		break;
+	default:
+		ilog(LOG_ERROR, "%s: unkonwn address family: %u\n",
+				__func__, src_addr->family);
+		break;
+	}
+}
+
+char *get_dtmf_event_as_json(GList *li, struct callmaster *m) {
+	struct mediaproxy_dtmfevent *e = li->data;
+	struct dtmf_event_call_iterator_data d;
+	char *res = NULL;
+	char ipaddr_str[64];
+	unsigned int duration;
+	JsonBuilder *builder;
+	JsonGenerator *gen = NULL;
+	JsonNode *root = NULL;
+
+	snprintf_dtmf_ip_addr(ipaddr_str, sizeof(ipaddr_str), &e->target_info.src_addr);
+
+	builder = json_builder_new();
+	json_builder_begin_object(builder);
+
+	ZERO(d);
+
+	d.found		= 0;
+	d.builder	= builder;
+	d.port		= e->target_info.local.port;
+
+	/* find and fill tags and clock_rate fields */
+	rwlock_lock_r(&m->hashlock);
+	g_hash_table_foreach(m->callhash, dtmf_event_call_iterator, &d);
+	rwlock_unlock_r(&m->hashlock);
+
+	if (!d.found) {
+		ilog(LOG_ERROR, "%s: call not found\n", __func__);
+		goto out;
+	}
+
+	/* duration in milliseconds */
+	duration = (e->duration * (1000000 / d.clock_rate)) / 1000;
+
+	/* fill the rest of the info */
+	JB_SET("type", "DTMF");
+	JB_SET("timestamp", "%lu", e->timestamp);
+	JB_SET("source_ip", "%s", ipaddr_str);
+	JB_SET("event", "%u", e->event);
+	JB_SET("duration", "%u", duration);
+	JB_SET("volume", "%d", e->volume);
+
+	json_builder_end_object(builder);
+
+	/* dump json object into string */
+	gen = json_generator_new();
+	root = json_builder_get_root(builder);
+	json_generator_set_root(gen, root);
+
+	res = json_generator_to_data(gen, NULL);
+	if (!res)
+		ilog(LOG_ERROR, "%s: failed to generate json string\n", __func__);
+
+out:
+	if (root)
+		json_node_free(root);
+	if (gen)
+		g_object_unref(gen);
+	g_object_unref(builder);
+
+	return res;
+}
+
+#endif	// NO_DTMF_CAPTURE
