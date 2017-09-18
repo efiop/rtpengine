@@ -862,8 +862,8 @@ static int filter_telephone_event_payloads(struct sdp_media *media,
 		range_list_str = str_dup(attr->u.fmtp.value);
 		range_list = g_strsplit(range_list_str->s, ",", -1);
 		for (range_list_it = range_list; *range_list_it != 0; range_list_it++) {
-			int range_start, range_end;
-			const char *range_start_s, *range_end_s;
+			int ret, range_start, range_end;
+			const char *range_start_s = NULL, *range_end_s = NULL;
 
 			ilog(LOG_DEBUG, "parsing range: '%s'", *range_list_it);
 
@@ -874,10 +874,21 @@ static int filter_telephone_event_payloads(struct sdp_media *media,
 				break;
 			}
 
-			pcre_get_substring(*range_list_it, ovector, r, 1, &range_start_s);
-			pcre_get_substring(*range_list_it, ovector, r, 3, &range_end_s);
-			if (range_end_s[0] == 0)
+			ret = pcre_get_substring(*range_list_it, ovector, r, 1, &range_start_s);
+			if (ret <= 0) {
+				ilog(LOG_ERROR, "Cannot get firs substring when parsing range: '%s'",
+											*range_list_it);
+				break;
+
+			}
+
+			ret = pcre_get_substring(*range_list_it, ovector, r, 3, &range_end_s);
+			if (ret <= 0) {
+				ilog(LOG_DEBUG, "Couldn't parse range end in '%s', "
+						"assuming start('%s') == end",
+						*range_list_it, range_start_s);
 				range_end_s = range_start_s;
+			}
 
 			ilog(LOG_DEBUG, "start: '%s'  end: '%s'", range_start_s, range_end_s);
 
